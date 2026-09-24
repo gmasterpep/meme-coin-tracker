@@ -1,74 +1,78 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import asyncio
+import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
+import aiohttp
+
 from app.config import settings
+from app.models import WalletPerformance
 
-
-@dataclass
-class FomoProfile:
-    name: str
-    wallet: str
-    score: float = 0.0
-    win_rate: float = 0.0
-    avg_return_pct: float = 0.0
-    recent_activity: list[str] = field(default_factory=list)
+logger = logging.getLogger(__name__)
 
 
 class FomoClient:
-    """Interface for Fomo data retrieval. Replace with real API or blockchain indexing integration."""
+    """Read-only client for the public PooTracker Fomo-compatible API.
 
-    def __init__(self, base_url: str | None = None, api_key: str | None = None):
-        self.base_url = base_url or settings.fomo_api_base_url
-        self.api_key = api_key or settings.fomo_api_key
+    The hosted stream currently documents live thesis events, not a guaranteed
+    complete trade stream. The adapter deliberately normalizes only fields it
+    can observe and never executes trades.
+    """
 
-    async def get_top_profiles(self) -> list[FomoProfile]:
-        """Return top Fomo profiles. Replace this placeholder with a real data source."""
-        return [
-            FomoProfile(
-                name="pyro",
-                wallet="0x0000000000000000000000000000000000000000",
-                score=88.0,
-                win_rate=0.73,
-                avg_return_pct=14.5,
-                recent_activity=["bought token A", "sold token B", "bought token C"],
-            ),
-            FomoProfile(
-                name="meme-lord",
-                wallet="0x1111111111111111111111111111111111111111",
-                score=82.0,
-                win_rate=0.68,
-                avg_return_pct=11.1,
-                recent_activity=["bought token X", "traded token Y"],
-            ),
-        ]
+    def __init__(self, base_url: str | None = None, stream_url: str | None = None):
+        self.base_url = (base_url or settings.fomo_api_base_url).rstrip("/")
+        self.stream_url = stream_url or settings.fomo_stream_url
 
-    async def get_wallet_activity(self, wallet_address: str) -> list[dict[str, Any]]:
-        """Return recent token buys/sells for a wallet."""
-        return [
-            {
-                "wallet": wallet_address,
-                "token_symbol": "ABC",
-                "token_address": "0xabc",
-                "buy_time": "2026-09-24T14:02:00Z",
-                "price_usd": 0.00034,
-                "quantity": 1500,
-                "direction": "buy",
-            }
-        ]
+    async def _get(self, path: str, **params: Any) -> Any:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"{self.base_url}{path}", params=params) as response:
+                response.raise_for_status()
+                return await response.json()
+
+    async def get_top_profiles(self) -> list[dict[str, Any]]:
+        data = await self._get("/v2/leaderboards/traders")
+        return data.get("items", data if isinstance(data, list) else [])
 
     async def get_token_metadata(self, token_address: str) -> dict[str, Any]:
-        """Return current metadata for a token. Replace with real blockchain or indexer data."""
-        return {
-            "symbol": "ABC",
-            "address": token_address,
-            "chain": "Solana",
-            "liquidity_usd": 350000,
-            "market_cap_usd": 2400000,
-            "launch_age_minutes": 19,
-            "holder_concentration_pct": 31.0,
-            "top_wallets": ["0xaaa", "0xbbb"],
-            "red_flags": [],
-            "green_flags": ["active community", "adequate liquidity", "fresh launch"],
-        }
+        data = await self._get(f"/v2/tokens/{token_address}/theses")
+        if isinstance(data, dict):
+            return {"address": token_address, **data}
+        return {"address": token_address}
+
+    async def stream_events(self) -> AsyncIterator[dict[str, Any]]:
+        timeout = aiohttp.ClientTimeout(total=None)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.ws_connect(self.stream_url, heartbeat=25) as socket:
+                await socket.send_json({"type": "subscribe", "subscription": {"type": "all"}})
+                async for message in socket:
+                    if message.type == aiohttp.WSMsgType.TEXT:
+                        yield message.json()
+                    elif message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                        raise ConnectionError("Fomo stream closed")
+
+
+def normalize_event(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract a token event from a documented stream frame when available."""
+    if message.get("type") != "thesis":
+        return None
+    data = message.get("data") or {}
+    if not isinstance(data, dict):
+        return None
+    token = data.get("token") or data.get("tokenAddress") or data.get("address")
+    if isinstance(token, dict):
+        token_address = token.get("address") or token.get("tokenAddress")
+        symbol = token.get("symbol") or token.get("name") or "UNKNOWN"
+    else:
+        token_address, symbol = token, data.get("symbol") or data.get("tokenSymbol") or "UNKNOWN"
+    if not token_address:
+        return None
+    return {
+        "token_address": token_address,
+        "symbol": symbol,
+        "direction": str(data.get("direction") or data.get("side") or "signal").lower(),
+        "trader": data.get("user") or data.get("handle") or data.get("username") or "unknown",
+        "raw": data,
+    }

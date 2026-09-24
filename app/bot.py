@@ -1,35 +1,51 @@
 from __future__ import annotations
 
-from typing import Any
+import logging
+
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 from app.config import settings
-from app.models import TokenOpportunity
+
+logger = logging.getLogger(__name__)
 
 
-class AlertRouter:
-    def format_opportunity(self, opportunity: TokenOpportunity) -> str:
-        if opportunity.buy_recommendation == "avoid":
-            status = "AVOID"
-        elif opportunity.buy_recommendation in {"strong-buy", "short-term-speculative"}:
-            status = "BUY / WATCH"
-        else:
-            status = "WATCH"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Meme Coin Tracker is online.\n"
+        "Live Fomo feed: connected by the worker when deployed.\n\n"
+        "Commands:\n/start\n/status\n/rank\n/paper"
+    )
 
-        return (
-            f"*{status}*\n"
-            f"Token: {opportunity.symbol}\n"
-            f"Chain: {opportunity.chain}\n"
-            f"Score: {opportunity.score:.1f}/100\n"
-            f"Risk: {opportunity.risk_score:.1f}/100\n"
-            f"Short-term: {opportunity.short_term_score:.1f}\n"
-            f"Long-term: {opportunity.long_term_score:.1f}\n"
-            f"Entry: {opportunity.recommended_entry}\n"
-            f"Stop: {opportunity.stop_loss}\n"
-            f"Target: {opportunity.target_exit}\n"
-            f"Summary: {opportunity.summary}\n"
-            f"Green flags: {', '.join(opportunity.green_flags) if opportunity.green_flags else 'n/a'}\n"
-            f"Red flags: {', '.join(opportunity.red_flags) if opportunity.red_flags else 'n/a'}"
-        )
 
-    def get_risk_cap_for_position(self, score: float) -> float:
-        return min(settings.max_position_pct, max(0.1, score / 100.0))
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        f"Paper trading: {'enabled' if settings.paper_trading_enabled else 'disabled'}\n"
+        f"Fomo feed: {settings.fomo_stream_url}\n"
+        f"Max position: {settings.max_position_pct}%\n"
+        "Live execution: disabled"
+    )
+
+
+async def rank(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Rankings are produced from incoming Fomo events. No live event has been ranked yet."
+    )
+
+
+async def paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings.paper_trading_enabled = not settings.paper_trading_enabled
+    await update.message.reply_text(
+        f"Paper trading set to: {'enabled' if settings.paper_trading_enabled else 'disabled'}"
+    )
+
+
+async def build_bot() -> Application:
+    if not settings.telegram_token:
+        raise ValueError("TELEGRAM_TOKEN is missing")
+    app = Application.builder().token(settings.telegram_token).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("rank", rank))
+    app.add_handler(CommandHandler("paper", paper))
+    return app
